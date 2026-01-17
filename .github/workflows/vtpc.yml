@@ -6,7 +6,7 @@ on:
       - main
   pull_request:
     paths:
-      - 'lab/vtpc/**'
+      - 'БЛР2/**'
 
 jobs:
   build:
@@ -20,7 +20,7 @@ jobs:
       image: silkeh/clang:latest
     defaults:
       run:
-        working-directory: ./lab/vtpc
+        working-directory: ./БЛР2
     steps:
       - name: Checkout
         uses: actions/checkout@v4
