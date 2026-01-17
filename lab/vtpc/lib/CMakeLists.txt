@@ -1,3 +1,6 @@
+project(MyProject LANGUAGES C)
+
+
 add_library(
     vtpc
     STATIC
