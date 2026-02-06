@@ -43,6 +43,11 @@ jobs:
           find . -path ./build -prune -o \
             \( -iname '*.c' -o -iname '*.h' -o -iname '*.cpp' -o -iname '*.hpp' \) -exec \
             clang-tidy -p ./build {} \;
+      - name: Prepare test environment
+        run: |
+          cd /__w/OperationSystem-2.1/OperationSystem-2.1/lab/vtpc
+          touch /tmp/a /tmp/b
+          chmod 666 /tmp/a /tmp/b  # Даем права на чтение/запись
 
       - name: Test Basic
         run: ./build/test/test_basic
