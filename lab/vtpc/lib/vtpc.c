@@ -1082,16 +1082,63 @@ int vtpc_close(int fd)
     return 0;
 }
 
+
+
+
 /**
- * @brief Чтение данных из файла
+ * @brief Чтение данных из файла с выровненным буфером
  *
- * Читает указанное количество байт из файла в буфер. Поддерживает прямой доступ к диску.
+ * Читает указанное количество байт из файла в выровненный буфер. Используется для прямого доступа к диску.
  *
  * @param fd Виртуальный дескриптор файла
- * @param buf Буфер для чтения данных
+ * @param aligned_buf Выровненный буфер для чтения данных
  * @param count Количество байт для чтения
  * @return Количество прочитанных байт или -1 в случае ошибки
  */
+ssize_t vtpc_read_aligned(int fd, void *aligned_buf, size_t count)
+{
+    // 1. ПРОВЕРКА ПАРАМЕТРОВ
+    if (fd < 0 || fd >= 1024 || !open_files[fd] || !aligned_buf)
+        return -1;
+
+    // 2. ПРОВЕРКА ВЫРАВНИВАНИЯ БУФЕРА (512 байт)
+    if (!is_aligned(aligned_buf, DIRECT_ALIGNMENT))
+        return -1;
+
+    FileInfo *info = open_files[fd];
+
+    // 3. ПРОВЕРКА КОНЦА ФАЙЛА
+    if (info->position >= info->file_size)
+        return 0;
+
+    // 4. ОГРАНИЧЕНИЕ ЧТЕНИЯ ДО РАЗМЕРА ФАЙЛА
+    size_t to_read = count;
+    if (info->position + (off_t)to_read > info->file_size)
+    {
+        to_read = info->file_size - info->position;
+    }
+
+    // 5. ОКРУГЛЕНИЕ РАЗМЕРА ДЛЯ O_DIRECT (кратно 512)
+    size_t aligned_count = ((to_read + DIRECT_ALIGNMENT - 1) / DIRECT_ALIGNMENT) * DIRECT_ALIGNMENT;
+
+    // 6. ПРЯМОЕ ЧТЕНИЕ С ДИСКА (ОБХОД КЭША ОС)
+    ssize_t bytes_read = direct_disk_read(info->fd, aligned_buf, aligned_count, info->position);
+
+    // 7. ОБРАБОТКА РЕЗУЛЬТАТА
+    if (bytes_read > 0)
+    {
+        // Если прочитали больше, чем requested (из-за округления)
+        if ((size_t)bytes_read > to_read)
+        {
+            bytes_read = to_read;
+        }
+        // ОБНОВЛЯЕМ ПОЗИЦИЮ В ФАЙЛЕ
+        info->position += bytes_read;
+    }
+
+    return bytes_read;
+}
+
 ssize_t vtpc_read(int fd, void *buf, size_t count)
 {
     if (fd < 0 || fd >= 1024 || !open_files[fd] || !buf)
@@ -1161,106 +1208,6 @@ ssize_t vtpc_write(int fd, const void *buf, size_t count)
     
     return bytes_written;
 }
-
-/**
- * @brief Чтение данных из файла с выровненным буфером
- *
- * Читает указанное количество байт из файла в выровненный буфер. Используется для прямого доступа к диску.
- *
- * @param fd Виртуальный дескриптор файла
- * @param aligned_buf Выровненный буфер для чтения данных
- * @param count Количество байт для чтения
- * @return Количество прочитанных байт или -1 в случае ошибки
- */
-ssize_t vtpc_read_aligned(int fd, void *aligned_buf, size_t count)
-{
-    // 1. ПРОВЕРКА ПАРАМЕТРОВ
-    if (fd < 0 || fd >= 1024 || !open_files[fd] || !aligned_buf)
-        return -1;
-
-    // 2. ПРОВЕРКА ВЫРАВНИВАНИЯ БУФЕРА (512 байт)
-    if (!is_aligned(aligned_buf, DIRECT_ALIGNMENT))
-        return -1;
-
-    FileInfo *info = open_files[fd];
-
-    // 3. ПРОВЕРКА КОНЦА ФАЙЛА
-    if (info->position >= info->file_size)
-        return 0;
-
-    // 4. ОГРАНИЧЕНИЕ ЧТЕНИЯ ДО РАЗМЕРА ФАЙЛА
-    size_t to_read = count;
-    if (info->position + (off_t)to_read > info->file_size)
-    {
-        to_read = info->file_size - info->position;
-    }
-
-    // 5. ОКРУГЛЕНИЕ РАЗМЕРА ДЛЯ O_DIRECT (кратно 512)
-    size_t aligned_count = ((to_read + DIRECT_ALIGNMENT - 1) / DIRECT_ALIGNMENT) * DIRECT_ALIGNMENT;
-
-    // 6. ПРЯМОЕ ЧТЕНИЕ С ДИСКА (ОБХОД КЭША ОС)
-    ssize_t bytes_read = direct_disk_read(info->fd, aligned_buf, aligned_count, info->position);
-
-    // 7. ОБРАБОТКА РЕЗУЛЬТАТА
-    if (bytes_read > 0)
-    {
-        // Если прочитали больше, чем requested (из-за округления)
-        if ((size_t)bytes_read > to_read)
-        {
-            bytes_read = to_read;
-        }
-        // ОБНОВЛЯЕМ ПОЗИЦИЮ В ФАЙЛЕ
-        info->position += bytes_read;
-    }
-
-    return bytes_read;
-}
-
-/**
- * @brief Запись данных в файл
- *
- * Записывает указанное количество байт из буфера в файл. Поддерживает прямой доступ к диску.
- *
- * @param fd Виртуальный дескриптор файла
- * @param buf Буфер с данными для записи
- * @param count Количество байт для записи
- * @return Количество записанных байт или -1 в случае ошибки
- */
-ssize_t vtpc_write(int fd, const void *buf, size_t count)
-{
-    if (fd < 0 || fd >= 1024 || !open_files[fd] || !buf)
-        return -1;
-
-    FileInfo *info = open_files[fd];
-
-    // Если используется прямой доступ
-    if (info->use_direct_io)
-    {
-        // Проверяем выравнивание для O_DIRECT
-        if (!is_aligned((void*)buf, DIRECT_ALIGNMENT) || 
-            (count % DIRECT_ALIGNMENT) != 0 ||
-            (info->position % DIRECT_ALIGNMENT) != 0)
-        {
-            return -1; // или реализуйте обработку невыровненных данных
-        }
-    }
-    
-    // Обычная запись
-    off_t old_pos = raw_lseek(info->fd, 0, SEEK_CUR);
-    raw_lseek(info->fd, info->position, SEEK_SET);
-    ssize_t bytes_written = raw_write(info->fd, buf, count);
-    raw_lseek(info->fd, old_pos, SEEK_SET);
-    
-    if (bytes_written > 0) {
-        info->position += bytes_written;
-        if (info->position > info->file_size) {
-            info->file_size = info->position;
-        }
-    }
-    
-    return bytes_written;
-}
-
 /**
  * @brief Запись данных в файл с выровненным буфером
  *
