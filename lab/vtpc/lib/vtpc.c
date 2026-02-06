@@ -931,6 +931,12 @@ int vtpc_open(const char *path, int flags, int mode)
         sys_flags = 0; // O_RDONLY
     }
 
+        // Добавляем флаг создания файла если требуется
+    if (flags & VTPC_O_CREAT)
+    {
+        sys_flags |= 0x40; // O_CREAT
+    }
+
     // Добавляем флаг прямого доступа если требуется
     if (flags & VTPC_O_DIRECT)
     {
