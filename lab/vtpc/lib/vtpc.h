@@ -1,4 +1,12 @@
 // vtpc.h
+
+
+// Статистика кэша
+
+extern int vtpc_cache_hits;
+extern int vtpc_cache_misses;
+extern int vtpc_cache_total;
+
 #ifndef VTPC_H
 #define VTPC_H
 
@@ -14,7 +22,7 @@
 
 // Основные функции API
 
-int vtpc_open(const char *path, int flags, int mode); 
+int vtpc_open(const char *path, int flags, int mode);
 int vtpc_close(int fd);
 ssize_t vtpc_read(int fd, void *buf, size_t count);
 ssize_t vtpc_write(int fd, const void *buf, size_t count);
@@ -31,3 +39,4 @@ ssize_t vtpc_read_direct(int fd, void *aligned_buf, size_t count);
 ssize_t vtpc_write_direct(int fd, const void *aligned_buf, size_t count);
 
 #endif // VTPC_H
+
