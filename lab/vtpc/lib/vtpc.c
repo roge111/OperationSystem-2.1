@@ -31,6 +31,13 @@
 #define VTPC_O_DIRECT 0x0010 // Прямой доступ к диску (O_DIRECT)
 #define VTPC_O_SYNC 0x0020   // Синхронная запись
 
+
+// ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ СТАТИСТИКИ КЭША ==========
+// Добавьте это после всех #include, примерно в начале файла после #define-ов
+int vtpc_cache_hits = 0;
+int vtpc_cache_misses = 0;
+int vtpc_cache_total = 0;
+
 // Определяем O_DIRECT для прямого доступа к диску
 #ifndef O_DIRECT
 #define O_DIRECT 00040000 /* прямой доступ к диску */
@@ -694,12 +701,17 @@ static void write_block_to_disk_direct(CacheBlock *block)
  */
 static CacheBlock *find_block_in_cache(int fd, off_t block_number)
 {
+    vtpc_cache_total++; // Увеличиваем общий счетчик операций
+
+    
+    
     CacheBlock *current = cache_manager.head;
 
     while (current != NULL)
     {
         if (current->fd == fd && current->block_number == block_number)
         {
+            vtpc_cache_hits++; // Попадание в кэш
             current->last_access = raw_time();
 
             // Перемещаем в начало списка (LRU)
@@ -740,6 +752,7 @@ static CacheBlock *find_block_in_cache(int fd, off_t block_number)
         current = current->next;
     }
 
+    vtpc_cache_misses++; // Промах кэша
     return NULL;
 }
 
@@ -1118,25 +1131,40 @@ ssize_t vtpc_read_aligned(int fd, void *aligned_buf, size_t count)
         to_read = info->file_size - info->position;
     }
 
-    // 5. ОКРУГЛЕНИЕ РАЗМЕРА ДЛЯ O_DIRECT (кратно 512)
-    size_t aligned_count = ((to_read + DIRECT_ALIGNMENT - 1) / DIRECT_ALIGNMENT) * DIRECT_ALIGNMENT;
+    // 5. РАБОТА С КЭШЕМ - читаем через кэш, а не напрямую с диска
+    size_t total = 0;
+    char *buffer = (char*)aligned_buf;
 
-    // 6. ПРЯМОЕ ЧТЕНИЕ С ДИСКА (ОБХОД КЭША ОС)
-    ssize_t bytes_read = direct_disk_read(info->fd, aligned_buf, aligned_count, info->position);
-
-    // 7. ОБРАБОТКА РЕЗУЛЬТАТА
-    if (bytes_read > 0)
-    {
-        // Если прочитали больше, чем requested (из-за округления)
-        if ((size_t)bytes_read > to_read)
-        {
-            bytes_read = to_read;
+    while (total < to_read) {
+        off_t pos = info->position + (off_t)total;
+        off_t block_num = get_block_number(pos);
+        off_t offset = get_block_offset(pos);
+        
+        size_t in_block = BLOCK_SIZE - offset;
+        size_t needed = to_read - total;
+        size_t copy = (in_block < needed) ? in_block : needed;
+        
+        spin_lock(&cache_manager.lock);
+        
+        CacheBlock *block = find_block_in_cache(fd, block_num);
+        
+        if (!block) {
+            block = allocate_new_block(fd, block_num);
+            if (!block) {
+                spin_unlock(&cache_manager.lock);
+                info->position += (off_t)total;
+                return total;
+            }
         }
-        // ОБНОВЛЯЕМ ПОЗИЦИЮ В ФАЙЛЕ
-        info->position += bytes_read;
+        
+        raw_memcpy(buffer + total, block->data + offset, copy);
+        total += copy;
+        
+        spin_unlock(&cache_manager.lock);
     }
 
-    return bytes_read;
+    info->position += (off_t)total;
+    return total;
 }
 
 ssize_t vtpc_read(int fd, void *buf, size_t count)
@@ -1166,16 +1194,40 @@ ssize_t vtpc_read(int fd, void *buf, size_t count)
         return -1; // или реализуйте обработку
     }
     
-    // Обычное чтение без O_DIRECT
-    off_t old_pos = raw_lseek(info->fd, 0, SEEK_CUR);
-    raw_lseek(info->fd, info->position, SEEK_SET);
-    ssize_t bytes_read = raw_read(info->fd, buf, to_read);
-    raw_lseek(info->fd, old_pos, SEEK_SET);
-    
-    if (bytes_read > 0) {
-        info->position += bytes_read;
+    // Обычное чтение через кэш
+    size_t total = 0;
+    char *buffer = (char*)buf;
+
+    while (total < to_read) {
+        off_t pos = info->position + (off_t)total;
+        off_t block_num = get_block_number(pos);
+        off_t offset = get_block_offset(pos);
+        
+        size_t in_block = BLOCK_SIZE - offset;
+        size_t needed = to_read - total;
+        size_t copy = (in_block < needed) ? in_block : needed;
+        
+        spin_lock(&cache_manager.lock);
+        
+        CacheBlock *block = find_block_in_cache(fd, block_num);
+        
+        if (!block) {
+            block = allocate_new_block(fd, block_num);
+            if (!block) {
+                spin_unlock(&cache_manager.lock);
+                info->position += (off_t)total;
+                return total;
+            }
+        }
+        
+        raw_memcpy(buffer + total, block->data + offset, copy);
+        total += copy;
+        
+        spin_unlock(&cache_manager.lock);
     }
-    return bytes_read;
+
+    info->position += (off_t)total;
+    return total;
 }
 
 ssize_t vtpc_write(int fd, const void *buf, size_t count)
@@ -1193,20 +1245,83 @@ ssize_t vtpc_write(int fd, const void *buf, size_t count)
         return -1;
     }
     
-    // Обычная запись без O_DIRECT
-    off_t old_pos = raw_lseek(info->fd, 0, SEEK_CUR);
-    raw_lseek(info->fd, info->position, SEEK_SET);
-    ssize_t bytes_written = raw_write(info->fd, buf, count);
-    raw_lseek(info->fd, old_pos, SEEK_SET);
-    
-    if (bytes_written > 0) {
-        info->position += bytes_written;
-        if (info->position > info->file_size) {
-            info->file_size = info->position;
+    // Обычная запись через кэш
+    size_t total_bytes_written = 0;
+    const char *buffer = (const char *)buf;
+
+    while (total_bytes_written < count)
+    {
+        off_t current_pos = info->position + (off_t)total_bytes_written;
+        off_t block_num = get_block_number(current_pos);
+        off_t block_offset = get_block_offset(current_pos);
+
+        size_t bytes_in_block = BLOCK_SIZE - block_offset;
+        size_t bytes_needed = count - total_bytes_written;
+        size_t bytes_to_copy = (bytes_in_block < bytes_needed) ? bytes_in_block : bytes_needed;
+
+        spin_lock(&cache_manager.lock);
+        
+        CacheBlock *block = find_block_in_cache(fd, block_num);
+
+        if (!block)
+        {
+            block = allocate_new_block(fd, block_num);
+            if (!block)
+            {
+                spin_unlock(&cache_manager.lock);
+                info->position += (off_t)total_bytes_written;
+                return total_bytes_written;
+            }
+        }
+
+        raw_memcpy(block->data + block_offset,
+                   buffer + total_bytes_written,
+                   bytes_to_copy);
+
+        block->dirty = 1;
+        block->last_access = raw_time();
+
+        if (block != cache_manager.head)
+        {
+            if (block->prev)
+                block->prev->next = block->next;
+            if (block->next)
+                block->next->prev = block->prev;
+
+            if (block == cache_manager.tail)
+            {
+                cache_manager.tail = block->prev;
+            }
+
+            block->prev = NULL;
+            block->next = cache_manager.head;
+
+            if (cache_manager.head)
+            {
+                cache_manager.head->prev = block;
+            }
+
+            cache_manager.head = block;
+
+            if (cache_manager.tail == NULL)
+            {
+                cache_manager.tail = block;
+            }
+        }
+
+        spin_unlock(&cache_manager.lock);
+
+        total_bytes_written += bytes_to_copy;
+
+        off_t new_end_pos = current_pos + (off_t)bytes_to_copy;
+        if (new_end_pos > info->file_size)
+        {
+            info->file_size = new_end_pos;
         }
     }
-    
-    return bytes_written;
+
+    info->position += (off_t)total_bytes_written;
+    return total_bytes_written;
 }
 /**
  * @brief Запись данных в файл с выровненным буфером
@@ -1586,4 +1701,3 @@ void vtpc_cleanup(void)
         }
     }
 }
-
